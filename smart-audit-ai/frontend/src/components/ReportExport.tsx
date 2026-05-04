@@ -1,0 +1,1 @@
+export default function ReportExport({scanId}:{scanId:number|null}){ if(!scanId) return null; const b='http://localhost:8000/api/scans/'+scanId; return <div><a href={`${b}/report.json`} target='_blank'>Export JSON</a> | <a href={`${b}/report.md`} target='_blank'>Export Markdown</a></div>}

@@ -1,0 +1,1 @@
+export default function CodeInput({value,onChange}:{value:string;onChange:(v:string)=>void}){return <textarea className='box' rows={14} value={value} onChange={e=>onChange(e.target.value)} placeholder='Collez votre code Solidity ici...'/>}

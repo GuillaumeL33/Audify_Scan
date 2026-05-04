@@ -1,0 +1,2 @@
+import type { Finding } from '../types';
+export default function FindingDetails({finding}:{finding:Finding|null}){if(!finding)return <div className='card'>Sélectionnez un finding.</div>; return <div className='card'><h3>{finding.title}</h3><p>{finding.description}</p><p><b>Impact:</b> {finding.impact}</p><p><b>Recommendation:</b> {finding.recommendation}</p><pre>{finding.patch_example}</pre></div>}
