@@ -1,0 +1,151 @@
+*** CorporateBond.sol	orig
+--- CorporateBond.sol	patched
+@@
+ contract CorporateBond is
+@@
+     uint256 public constant UPGRADE_DELAY = 48 hours;
++    uint256 public constant EMERGENCY_REDEMPTION_GRACE_PERIOD = 30 days;
+@@
+     event UpgradeProposed(address indexed implementation, uint256 executableAt);
+     event UpgradeCancelled(address indexed implementation);
++    event EmergencyRedemptionRateSet(uint256 rate, uint256 effectiveAt);
++    event EarlyBuybackPoolWithdrawn(address indexed issuer, uint256 amount);
+@@ function activateBond()
+-        issueDate            = block.timestamp;
++        // Prevent admin timing manipulation on bullet interest accrual reference.
++        issueDate            = terms.subscriptionEnd;
+         nextCouponDate       = block.timestamp + terms.couponFrequency;
+         couponEligibleSupply = totalSubscribed;
+@@
+     function redeemBonds(uint256 bondAmount) external nonReentrant onlyState(State.MATURED) {
+@@
+     }
++
++    /**
++     * @notice Emergency path in case issuer does not fund repayment after maturity.
++     *         Admin can set a redemption rate (0 allowed for full default signaling)
++     *         only after a grace period.
++     */
++    function setEmergencyRedemptionRate(uint256 rate)
++        external
++        onlyRole(ADMIN_ROLE)
++        onlyState(State.MATURED)
++    {
++        require(redemptionRate == 0, "Bond: already repaid");
++        require(
++            block.timestamp >= terms.maturityDate + EMERGENCY_REDEMPTION_GRACE_PERIOD,
++            "Bond: grace period not expired"
++        );
++        redemptionRate = rate;
++        emit EmergencyRedemptionRateSet(rate, block.timestamp);
++    }
+@@
+     function openEarlyBuyback(uint256 totalFunds, uint256 ratePerBond)
+@@
+         emit EarlyBuybackOpened(totalFunds, ratePerBond);
+     }
++
++    /**
++     * @notice Withdraw unused early buyback funds once bond is no longer ACTIVE.
++     */
++    function withdrawUnusedEarlyBuybackPool()
++        external
++        nonReentrant
++        onlyRole(ISSUER_ROLE)
++    {
++        require(
++            state == State.MATURED || state == State.CLOSED || state == State.FAILED,
++            "Bond: buyback pool still active"
++        );
++        uint256 remaining = earlyBuybackPool;
++        require(remaining > 0, "Bond: empty buyback pool");
++        earlyBuybackPool = 0;
++        IERC20(terms.paymentToken).safeTransfer(terms.issuer, remaining);
++        emit EarlyBuybackPoolWithdrawn(terms.issuer, remaining);
++    }
+
+*** BondaryMarketplace.sol	orig
+--- BondaryMarketplace.sol	patched
+@@
+ contract BondaryMarketplace is AccessControl, ReentrancyGuard, Pausable {
+@@
+     uint256 private _nextOrderId;
++    uint256 public constant RECOVERY_DELAY = 24 hours;
+@@
+     mapping(uint256 => Order) public orders;
++    mapping(uint256 => address) public pendingRecoveryRecipient;
++    mapping(uint256 => uint256) public pendingRecoveryEta;
+@@
+     event FeesUpdated(uint256 tradingFeeBps, uint256 earlyExitPenaltyBps);
++    event EscrowRecoveryProposed(uint256 indexed orderId, address indexed recipient, uint256 executeAfter);
++    event EscrowRecoveryCancelled(uint256 indexed orderId);
+@@ constructor(
+-        require(_compliance   != address(0), "Marketplace: zero compliance");
++        require(admin         != address(0), "Marketplace: zero admin");
++        require(_compliance   != address(0), "Marketplace: zero compliance");
+         require(_feeCollector != address(0), "Marketplace: zero feeCollector");
+         require(_factory      != address(0), "Marketplace: zero factory");
+@@ function fillOrder(uint256 orderId) external nonReentrant whenNotPaused {
+         Order storage order = orders[orderId];
+         require(order.active,                          "Marketplace: order not active");
+@@
++        // Effects first to respect CEI and prevent cross-function state races.
++        order.active = false;
++
+         CorporateBond cb = CorporateBond(order.bond);
+         address paymentToken = cb.getTerms().paymentToken;
+@@
+-        order.active = false;
+         emit OrderFilled(orderId, msg.sender, order.bondAmount, totalCost, tradingFee, penaltyFee);
+     }
+@@
+-    function recoverEscrowedBonds(uint256 orderId, address newRecipient)
++    function proposeEscrowedBondsRecovery(uint256 orderId, address newRecipient)
+         external
+-        nonReentrant
+         onlyRole(ADMIN_ROLE)
+     {
+         Order storage order = orders[orderId];
+         require(order.active,                           "Marketplace: order not active");
+         require(!compliance.isVerified(order.seller),   "Marketplace: seller still compliant");
+         require(compliance.isVerified(newRecipient),    "Marketplace: recipient not compliant");
++
++        pendingRecoveryRecipient[orderId] = newRecipient;
++        pendingRecoveryEta[orderId] = block.timestamp + RECOVERY_DELAY;
++        emit EscrowRecoveryProposed(orderId, newRecipient, pendingRecoveryEta[orderId]);
++    }
++
++    function cancelEscrowedBondsRecovery(uint256 orderId)
++        external
++        onlyRole(ADMIN_ROLE)
++    {
++        require(pendingRecoveryRecipient[orderId] != address(0), "Marketplace: no pending recovery");
++        delete pendingRecoveryRecipient[orderId];
++        delete pendingRecoveryEta[orderId];
++        emit EscrowRecoveryCancelled(orderId);
++    }
++
++    function executeEscrowedBondsRecovery(uint256 orderId)
++        external
++        nonReentrant
++        onlyRole(ADMIN_ROLE)
++    {
++        Order storage order = orders[orderId];
++        require(order.active, "Marketplace: order not active");
++        require(!compliance.isVerified(order.seller), "Marketplace: seller still compliant");
++        address newRecipient = pendingRecoveryRecipient[orderId];
++        require(newRecipient != address(0), "Marketplace: no pending recovery");
++        require(block.timestamp >= pendingRecoveryEta[orderId], "Marketplace: recovery timelocked");
++        require(compliance.isVerified(newRecipient), "Marketplace: recipient not compliant");
+ 
+         address bond      = order.bond;
+         uint256 amount    = order.bondAmount;
+         address seller    = order.seller;
+ 
+         order.active = false;
++        delete pendingRecoveryRecipient[orderId];
++        delete pendingRecoveryEta[orderId];
+         IERC20(bond).safeTransfer(newRecipient, amount);
+ 
+         emit EscrowedBondsRecovered(orderId, seller, newRecipient, amount);
+     }
